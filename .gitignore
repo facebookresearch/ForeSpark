@@ -1,0 +1,12 @@
+.venv
+.tools/
+__pycache__/
+*.egg-info/
+build/
+.pytest_cache/
+data/
+runs/
+results/
+plot/plots/
+plot/.cache/
+plot/fonts/*.ttf

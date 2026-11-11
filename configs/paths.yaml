@@ -1,0 +1,18 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Where bulky artifacts live. Relative paths resolve against the repo root; `~` and $VARS are expanded. A blank key
+# falls back to the default beside it. FORESPARK_<KEY> in the environment overrides a key (FORESPARK_DATA=/scratch).
+
+data:          # default data/: prompt pool, regenerated corpus, prepared shards, benchmark prompts
+runs:          # default runs/: drafter checkpoints and training logs
+results:       # default results/: calibrations and benchmark results, one tree per target
+
+# One 250-400 MB file per training sample streams through here; tmpfs helps a lot. HIDDEN_STATES_PATH overrides.
+hidden_states: /dev/shm/hidden_states
+
+# ~15 GB once vLLM and its checkouts are in it. setup.sh builds it here and links .venv to it.
+venv:          # default .venv

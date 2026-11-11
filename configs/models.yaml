@@ -1,0 +1,147 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Targets we train drafters for and benchmark against.
+#
+# repo, revision: the target on Hugging Face at a pinned commit; regeneration, tokenization, hidden states, training
+#              and benchmarks all read that commit (config.target_snapshot, the benchmarks' --revision).
+# layers:      target layers whose hidden states feed the drafter (the published drafters' layers where one exists).
+# k:           draft tokens per step. Block size is derived per method, never set: ForeSpark's DFlash2 block = k+1
+#              (the anchor is the bonus token), DSpark's = k.
+# max_anchors: training positions per sequence (randomly subsampled above it).
+# epochs:      equal for both drafters so they compare at an equal budget.
+# sampling:    merged into regeneration requests (includes chat_template_kwargs).
+# max_num_seqs: scheduler width; a sweep point above it is refused.
+# vllm_args:   extra flags for every server started for this target.
+# parallel:    --parallel (tp|dp) of the hidden-state and regeneration servers (benchmarks always run tp).
+# expert_parallel: MoE only; EP flags ride with tp.
+# nvcc:        vLLM compiles kernels at startup; launchers point CUDA_HOME at the local toolkit matching torch's
+#              CUDA unless it is already set.
+# blackwell:   args appended per key on sm_100 GPUs only (vLLM refuses them elsewhere).
+# cpu_ranking: a backend plans from host lengths, so adaptive verification and Fore-D rank verification (and
+#              draft widths) on the host, one step lagged.
+# draft_overrides: full transformer_layer_config for the drafter when deriving it from the verifier is wrong.
+
+qwen14:
+  port: 8200
+  repo: Qwen/Qwen3-14B
+  revision: 40c069824f4251a91eefaf281ebe4c544efd3e18
+  layers: [1, 10, 19, 28, 37]   # matches deepseek-ai's published Qwen3-14B drafters
+  k: 15
+  max_num_seqs: 512
+  max_anchors: 3072
+  epochs: 3
+  sampling:                     # Qwen3 non-thinking preset
+    temperature: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0
+    chat_template_kwargs: {enable_thinking: false}
+
+glm53flash:
+  port: 8204
+  # NVIDIA's ModelOpt NVFP4 of zai-org/GLM-5.3-Flash (the verifier of the published incoai/GLM-5.3-Flash-DFlash2):
+  # routed experts W4A4 (block 16); attention, shared experts, routers and embeddings unquantized; FP8 KV cache.
+  # NVFP4 is Blackwell-native; H100s run the experts through Marlin (FP4 weights, BF16 activations), close to B200
+  # but not identical, so regenerate, train and benchmark on B200.
+  repo: nvidia/GLM-5.3-Flash-NVFP4
+  revision: da920bb0b9f4a06727223a349e55468e38352348
+  # The published drafter's layers: its target_layer_ids [5, 14, 24, 33, 42] + 1, as for glm53 below. The target
+  # runs mHC (4 residual streams): vllm.patch gives Glm5Next the EAGLE-3 capture, streams averaged.
+  layers: [6, 15, 25, 34, 43]
+  k: 15
+  max_num_seqs: 512
+  max_anchors: 3072
+  epochs: 3
+  sampling:                     # generation_config.json
+    temperature: 1.0
+    top_p: 0.95
+    # Thinking cannot be switched off (the template always opens <think>); "low" is the shortest budget.
+    chat_template_kwargs: {reasoning_effort: low}
+  # MLA (head_dim 0, qk 256) and MoE sizes mislead the derivation: the published drafter's decoder, pinned.
+  draft_overrides:
+    model_type: qwen3
+    hidden_size: 4096
+    vocab_size: 154880
+    num_hidden_layers: 5
+    num_attention_heads: 32
+    num_key_value_heads: 8
+    head_dim: 128
+    intermediate_size: 12288
+    sliding_window: 2048
+    use_sliding_window: true      # Qwen3Config drops sliding_window without it
+    max_window_layers: 5
+    layer_types: [sliding_attention, sliding_attention, sliding_attention,
+                  sliding_attention, sliding_attention]
+    hidden_act: silu
+    max_position_embeddings: 1048576
+    rms_norm_eps: 1.0e-05
+    initializer_range: 0.02
+    rope_theta: 10000.0
+    attention_bias: false
+    tie_word_embeddings: false
+  parallel: tp                  # ~185 GB of weights: TP + EP
+  expert_parallel: true         # 288 experts
+  nvcc: true
+  cpu_ranking: true             # every vLLM sparse-MLA backend plans its rows from host positions
+  # Text only: no vision-encoder profiling or cache. H100's only sparse-MLA backend (FlashInfer SM90) rejects the
+  # checkpoint's FP8 cache layout, so the cache is BF16 there.
+  vllm_args: [--limit-mm-per-prompt, '{"image": 0, "video": 0}', --kv-cache-dtype, bfloat16]
+  blackwell:
+    vllm_args: [--kv-cache-dtype, fp8]   # appended after the above, so FP8 wins on B200
+
+glm53:
+  port: 8205
+  # GLM-5.3 (MLA + DSA sparse attention, 256-expert MoE) with ModelOpt NVFP4 routed experts (the rest BF16, FP8 KV
+  # cache): the verifier of the published incoai/GLM-5.3-DFlash2. NVFP4 is Blackwell-native; H100s run it through
+  # Marlin (FP4 weights, BF16 activations), close to B200 but not identical, so train and benchmark on B200.
+  repo: incoai/GLM-5.3-NVFP4
+  revision: 54e52520606f96b3d9fc84088ad22882a61648ac
+  # The published drafter's layers. Its target_layer_ids [5, 19, .., 75] name a layer's output (vLLM captures id + 1);
+  # speculators' aux_hidden_state_layer_ids, which both drafters train and serve with, name the captured layer's
+  # input. So +1 here reads the same states.
+  layers: [6, 20, 34, 48, 62, 76]
+  k: 15
+  max_num_seqs: 512
+  max_anchors: 3072
+  epochs: 3
+  sampling:                     # generation_config.json
+    temperature: 1.0
+    top_p: 0.95
+    # Thinking cannot be switched off (the template always opens <think>); "low" is the shortest budget.
+    chat_template_kwargs: {reasoning_effort: low}
+  # MLA and MoE sizes mislead the derivation: the published drafter's decoder, pinned (six layers at the target's
+  # width).
+  draft_overrides:
+    model_type: qwen3
+    hidden_size: 6144
+    vocab_size: 154880
+    num_hidden_layers: 6
+    num_attention_heads: 64
+    num_key_value_heads: 8
+    head_dim: 128
+    intermediate_size: 12288
+    sliding_window: 2048
+    use_sliding_window: true      # Qwen3Config drops sliding_window without it
+    max_window_layers: 6
+    layer_types: [sliding_attention, sliding_attention, sliding_attention,
+                  sliding_attention, sliding_attention, sliding_attention]
+    hidden_act: silu
+    max_position_embeddings: 1048576
+    rms_norm_eps: 1.0e-05
+    initializer_range: 0.02
+    rope_theta: 1000000.0
+    attention_bias: false
+    tie_word_embeddings: false
+  parallel: tp                  # 433 GiB: TP + EP
+  expert_parallel: true         # 256 experts
+  nvcc: true                    # the DSA indexer's DeepGEMM kernels JIT-compile at load
+  cpu_ranking: true             # DSA runs sparse MLA, which plans its rows from host positions
+  # H100's only sparse-MLA backend (FlashInfer SM90) hands the checkpoint's FP8 cache to FlashInfer's planner as its
+  # uint8 storage dtype, which it refuses; a BF16 cache works. Blackwell keeps the checkpoint's FP8 cache.
+  vllm_args: [--kv-cache-dtype, bfloat16]
+  blackwell:
+    vllm_args: [--kv-cache-dtype, auto]

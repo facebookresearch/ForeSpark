@@ -1,0 +1,32 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+# Installed editable into the pinned venv by setup.sh. It is a package for two
+# reasons: vLLM loads `vllm.general_plugins` entry points in every process
+# (workers included), and the speculators trainer finds `dflash2_conf` only if
+# it can import it by name.
+
+[project]
+name = "forespark"
+version = "0.1.0"
+description = "ForeSpark: a DFlash2 drafter with confidence and Fore-D heads, scheduled by Fore-D, on vLLM"
+# CC-BY-NC but for the files that adapt vLLM and speculators (Apache 2.0) or DFlash2 (MIT, in its file's header).
+license = "CC-BY-NC-4.0 AND Apache-2.0 AND MIT"
+license-files = ["LICENSE", "LICENSES/*"]
+requires-python = ">=3.12"
+# vllm, speculators and torch are pinned by setup.sh; naming them here would
+# invite a resolver to replace those pins.
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+forespark = "forespark:register"
+
+[build-system]
+requires = ["setuptools>=77"]  # SPDX `license` (PEP 639)
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["forespark*"]

@@ -1,0 +1,1350 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Modifications to vLLM v0.30.0 (https://github.com/vllm-project/vllm) at ced6857afa0e, which setup.sh applies
+# to the pinned checkout. Like the files they change, they are licensed under the Apache License 2.0
+# (LICENSES/Apache-2.0.txt). `git apply` skips these lines.
+
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 2396b26cb0..26ff616f2a 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1546,9 +1546,13 @@ class SpeculativeConfig:
+                     )
+                 )
+ 
++                # A dense drafter on an EP target has no experts to shard, and
++                # a parallel config with EP on refuses it.
+                 self.draft_parallel_config = (
+                     SpeculativeConfig.create_draft_parallel_config(
+-                        self.target_parallel_config, self.draft_tensor_parallel_size
++                        self.target_parallel_config,
++                        self.draft_tensor_parallel_size,
++                        expert_parallel=self.draft_model_config.is_moe,
+                     )
+                 )
+ 
+@@ -1746,6 +1750,7 @@ class SpeculativeConfig:
+     def create_draft_parallel_config(
+         target_parallel_config: ParallelConfig,
+         speculative_draft_tensor_parallel_size: int,
++        expert_parallel: bool = True,
+     ) -> ParallelConfig:
+         """Create a parallel config for use by the draft worker.
+ 
+@@ -1754,7 +1759,8 @@ class SpeculativeConfig:
+         draft_parallel_config = ParallelConfig(
+             pipeline_parallel_size=1,
+             tensor_parallel_size=speculative_draft_tensor_parallel_size,
+-            enable_expert_parallel=target_parallel_config.enable_expert_parallel,
++            enable_expert_parallel=expert_parallel
++            and target_parallel_config.enable_expert_parallel,
+             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
+             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
+             disable_custom_all_reduce=target_parallel_config.disable_custom_all_reduce,
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/example_hidden_states_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/example_hidden_states_connector.py
+index d291d47544..59aee1a635 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/example_hidden_states_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/example_hidden_states_connector.py
+@@ -115,11 +115,22 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
+         from vllm.v1.kv_cache_interface import HiddenStateCacheSpec
+ 
+         groups = kv_cache_config.kv_cache_groups
+-        group_ids = [
+-            gid
+-            for gid, group in enumerate(groups)
+-            if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)
+-        ]
++        # forespark: on MLA verifiers the hidden-state layer can share the MLA
++        # group, whose spec is a UniformTypeKVCacheSpecs wrapper or the parent
++        # MLAAttentionSpec. Sharing is safe: the tensor is taken by layer
++        # name and the group's block table/size describe this layer too.
++        def holds_hidden_state(group) -> bool:
++            spec = group.kv_cache_spec
++            if isinstance(spec, HiddenStateCacheSpec):
++                return True
++            inner = getattr(spec, "kv_cache_specs", None)
++            if inner and any(
++                isinstance(s, HiddenStateCacheSpec) for s in inner.values()
++            ):
++                return True
++            return any("cache_only_layers." in name for name in group.layer_names)
++
++        group_ids = [gid for gid, g in enumerate(groups) if holds_hidden_state(g)]
+         if len(group_ids) == 1:
+             return group_ids[0]
+         if not group_ids and len(groups) == 1:
+@@ -517,7 +528,11 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
+         the hidden states from the KV cache.
+         """
+         req_id = request.request_id
+-        filename = self._request_filenames.pop(req_id)
++        # forespark: a client that disconnects aborts requests that never got a file
++        # (still waiting); that killed the engine and every other trainer's fetches.
++        filename = self._request_filenames.pop(req_id, None)
++        if filename is None:
++            return False, None
+         kv_params = request.kv_transfer_params or {}
+         if kv_params.get("include_output_tokens", False):
+             # Exclude the final token — it was the model's output, never an
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+index 2a314042de..0fb08442fa 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+@@ -601,13 +601,43 @@ def sparse_attn_indexer_kpool(
+         # order so each token is stashed before the next completes its pool.
+         # Positions must remain token-granular because the kernel derives the
+         # pool phase and tail index from ``pos % kpool``.
+-        if (
++        kpool_write = (
+             index_kpool > 1
+             and gate_score is not None
+             and compress_ape is not None
+             and positions is not None
+             and not skip_k_cache_insert
+-        ):
++        )
++        starts = decode_metadata.per_req_decode_starts
++        if kpool_write and starts is not None:
++            # Adaptive verification replays this graph with any mix of decode
++            # lengths, not the capture batch's: read every request in place.
++            # Eager passes too: an EAGLE/MTP draft prefill runs on the target's
++            # FULL-graph metadata, whose num_decode_tokens counts padding no
++            # request owns.
++            tail_meta = (
++                attn_metadata.get(_resolve_layer_name(tail_prefix))
++                if tail_prefix is not None
++                else None
++            )
++            if tail_meta is not None and tail_kv_cache is not None:
++                assert isinstance(tail_meta, DeepseekV32IndexerMetadata)
++                kpool_ops.kpool_decode_update_and_maybe_write_cache_varlen(
++                    kv_cache_raw,
++                    tail_kv_cache,
++                    tail_meta.slot_mapping[:num_decode_tokens],
++                    k[:num_decode_tokens],
++                    gate_score[:num_decode_tokens],
++                    compress_ape,
++                    slot_mapping[:num_decode_tokens],
++                    positions[:num_decode_tokens].to(torch.int32),
++                    starts,
++                    decode_metadata.per_req_decode_lens,
++                    index_kpool,
++                    head_dim,
++                    round_scale=(scale_fmt is not None),
++                )
++        elif kpool_write:
+             num_requests = attn_metadata_narrowed.num_decodes
+             # Kpool writes must recover the original request grouping after the
+             # indexer's flattened decode path. Host metadata avoids a CUDA graph
+diff --git a/vllm/models/deepseek_v32/nvidia/model.py b/vllm/models/deepseek_v32/nvidia/model.py
+index b42ba28c8d..3be8f5b333 100644
+--- a/vllm/models/deepseek_v32/nvidia/model.py
++++ b/vllm/models/deepseek_v32/nvidia/model.py
+@@ -287,8 +287,21 @@ class DeepseekV32Model(torch.nn.Module):
+             start=self.start_layer,
+         ):
+             if idx in self.aux_hidden_state_layers:
++                if residual is not None and not self.use_sequence_parallel:
++                    # forespark: the previous layer left its MLP output un-reduced,
++                    # a per-rank partial. Run the all-reduce + norm the layer
++                    # would fuse into its input_layernorm here, so the captured
++                    # stream is complete and identical on every TP rank; the
++                    # layer then starts from it as from the embedding.
++                    attn_in, hidden_states = fused_allreduce_rms_norm(
++                        hidden_states, residual, layer.input_layernorm
++                    )
++                    residual = None
++                # A copy: the layer may update its residual in place.
+                 aux_hidden_states.append(
+-                    hidden_states if residual is None else hidden_states + residual
++                    hidden_states.clone()
++                    if residual is None
++                    else hidden_states + residual
+                 )
+             hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
+             attn_in = None
+@@ -301,7 +314,12 @@ class DeepseekV32Model(torch.nn.Module):
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+ 
++        # forespark: the final hidden state (layer id end_layer), as DeepseekV2Model
++        # captures it; extract_hidden_states asks for it with the target layers.
++        capture_final = self.end_layer in self.aux_hidden_state_layers
+         if self.use_sequence_parallel:
++            if capture_final:
++                aux_hidden_states.append(hidden_states + residual)
+             hidden_states, _ = self.norm(hidden_states, residual)
+             if aux_hidden_states:
+                 hidden_size = hidden_states.shape[-1]
+@@ -316,9 +334,12 @@ class DeepseekV32Model(torch.nn.Module):
+             else:
+                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+         else:
+-            hidden_states, _ = fused_allreduce_rms_norm(
++            # forespark: the final norm's reduced stream, as for the layers above.
++            hidden_states, residual = fused_allreduce_rms_norm(
+                 hidden_states, residual, self.norm
+             )
++            if capture_final:
++                aux_hidden_states.append(residual)
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+         return hidden_states
+diff --git a/vllm/models/glm5next/nvidia/model.py b/vllm/models/glm5next/nvidia/model.py
+index 21918bdf6b..779afddda7 100644
+--- a/vllm/models/glm5next/nvidia/model.py
++++ b/vllm/models/glm5next/nvidia/model.py
+@@ -60,9 +60,11 @@ from vllm.model_executor.models.glm4_1v import (
+     Glm4vForConditionalGeneration,
+ )
+ from vllm.model_executor.models.interfaces import (
++    EagleModelMixin,
+     HasInnerState,
+     IsHybrid,
+     MixtureOfExperts,
++    SupportsEagle3,
+     SupportsPP,
+ )
+ from vllm.model_executor.models.utils import (
+@@ -619,7 +621,7 @@ class Glm5NextDecoderLayer(nn.Module):
+         )
+ 
+ 
+-class Glm5NextModel(nn.Module):
++class Glm5NextModel(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -726,10 +728,23 @@ class Glm5NextModel(nn.Module):
+         if self.is_sequence_parallel:
+             hidden_states = sp_shard(hidden_states)
+ 
++        aux_hidden_states: list[torch.Tensor] = []
+         for layer in self._active_layers:
+             hidden_states, residual, post, comb = layer(
+                 positions, hidden_states, residual, post, comb
+             )
++            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
++                aux = hidden_states
++                if post is not None:
++                    # The layer deferred its hc_post into the next layer's fused
++                    # pre: materialize the residual streams out of place and
++                    # average them, as the last layer contracts its own.
++                    aux = hc_contract(
++                        layer.hc_post(hidden_states, residual, post, comb), layer.n
++                    )
++                if self.is_sequence_parallel:
++                    aux = sp_all_gather(aux)[:full_num_tokens]
++                aux_hidden_states.append(aux)
+ 
+         if not get_pp_group().is_last_rank:
+             # PP is gated off for GLM-5.3-Flash (no make_empty_intermediate_tensors),
+@@ -745,6 +760,8 @@ class Glm5NextModel(nn.Module):
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+ 
+         hidden_states = self.norm(hidden_states)
++        if aux_hidden_states:
++            return hidden_states, aux_hidden_states
+         return hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -931,7 +948,7 @@ class Glm5NextModel(nn.Module):
+ 
+ 
+ class Glm5NextForCausalLM(
+-    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
++    nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
+ ):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -1027,7 +1044,11 @@ class Glm5NextForCausalLM(
+     dummy_inputs=Glm4vDummyInputsBuilder,
+ )
+ class Glm5NextForConditionalGeneration(
+-    Glm4vForConditionalGeneration, HasInnerState, IsHybrid, MixtureOfExperts
++    Glm4vForConditionalGeneration,
++    HasInnerState,
++    IsHybrid,
++    MixtureOfExperts,
++    SupportsEagle3,
+ ):
+     # The text model (KDA + dense-MLA + MoE) is a hybrid mamba model. The
+     # multimodal wrapper must declare the same interfaces so vLLM treats it as
+diff --git a/vllm/models/glm5next/nvidia/ops/kpool_compress.py b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
+index 70b41021aa..163c736fb2 100644
+--- a/vllm/models/glm5next/nvidia/ops/kpool_compress.py
++++ b/vllm/models/glm5next/nvidia/ops/kpool_compress.py
+@@ -453,6 +453,8 @@ def _kpool_decode_update_batched_kernel(
+     ape_stride_0,
+     slot_mapping_ptr,  # [B, NEXT_N] int32
+     positions_ptr,  # [B, NEXT_N] int32
++    req_start_ptr,  # VARLEN: [B] first token of each request
++    req_len_ptr,  # VARLEN: [B] tokens of each request
+     NEXT_N,  # runtime token count per request (no .item() needed)
+     PAGE_SIZE: tl.constexpr,
+     BUF_NUMEL_PER_PAGE: tl.constexpr,
+@@ -463,6 +465,10 @@ def _kpool_decode_update_batched_kernel(
+     S_OFFSET_NBYTES_IN_PAGE: tl.constexpr,
+     ROUND_SCALE: tl.constexpr,
+     BLOCK_D: tl.constexpr,
++    # Flat token layout ([N] ints, [N, HEAD_DIM] key/score): request ``req``
++    # owns tokens [req_start, req_start + req_len); the *_stride_t step one
++    # token and the *_stride_b are unused.
++    VARLEN: tl.constexpr = False,
+ ):
+     """One program per request; iterates its NEXT_N verify tokens in order.
+ 
+@@ -480,8 +486,19 @@ def _kpool_decode_update_batched_kernel(
+     offs = tl.arange(0, BLOCK_D)
+     dim_mask = offs < HEAD_DIM
+ 
+-    for t in tl.range(0, NEXT_N):
+-        idx = req * NEXT_N + t
++    if VARLEN:
++        first = tl.load(req_start_ptr + req).to(tl.int64)
++        num_tokens = tl.load(req_len_ptr + req)
++        key_base = first * key_stride_t
++        ss_base = first * ss_stride_t
++    else:
++        first = req.to(tl.int64) * NEXT_N
++        num_tokens = NEXT_N
++        key_base = req.to(tl.int64) * key_stride_b
++        ss_base = req.to(tl.int64) * ss_stride_b
++
++    for t in tl.range(0, num_tokens):
++        idx = first + t
+         cache_loc = tl.load(slot_mapping_ptr + idx)
+         pos = tl.load(positions_ptr + idx)
+         safe_pos = tl.maximum(pos, 0)
+@@ -508,12 +525,12 @@ def _kpool_decode_update_batched_kernel(
+         stash_valid = (pos >= 0) & (tail_slot >= 0)
+ 
+         key = tl.load(
+-            key_ptr + req * key_stride_b + t * key_stride_t + offs,
++            key_ptr + key_base + t * key_stride_t + offs,
+             mask=dim_mask,
+             other=0.0,
+         ).to(tl.float32)
+         score_current = tl.load(
+-            slot_score_ptr + req * ss_stride_b + t * ss_stride_t + offs,
++            slot_score_ptr + ss_base + t * ss_stride_t + offs,
+             mask=dim_mask,
+             other=0.0,
+         ).to(tl.float32)
+@@ -690,6 +707,8 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+         ape.stride(0),
+         slot_mapping,
+         positions,
++        positions,  # req_start/req_len: unused outside VARLEN
++        positions,
+         next_n,
+         PAGE_SIZE=page_size,
+         BUF_NUMEL_PER_PAGE=buf.stride(0),
+@@ -703,6 +722,77 @@ def kpool_decode_update_and_maybe_write_cache_batched(
+     )
+ 
+ 
++def kpool_decode_update_and_maybe_write_cache_varlen(
++    kv_cache: torch.Tensor,
++    tail_kv_cache: torch.Tensor,
++    tail_slot_mapping: torch.Tensor,
++    key: torch.Tensor,
++    slot_score: torch.Tensor,
++    ape: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    positions: torch.Tensor,
++    req_start: torch.Tensor,
++    req_len: torch.Tensor,
++    pool_size: int,
++    head_dim: int = INDEX_HEAD_DIM,
++    round_scale: bool = True,
++) -> None:
++    """``kpool_decode_update_and_maybe_write_cache_batched`` on the flat decode
++    tokens: request ``r`` owns tokens ``[req_start[r], req_start[r] + req_len[r])``
++    of ``key`` / ``slot_score`` (``[N, head_dim]``) and the ``[N]`` int tensors,
++    read in place, so any mix of lengths works (a CUDA graph replayed with
++    batches unlike its capture batch). Tokens no request owns are not touched.
++    """
++    num_requests = req_start.shape[0]
++    if num_requests == 0:
++        return
++    assert tail_kv_cache.ndim == 4
++    assert tail_kv_cache.shape[1] == 2
++    assert tail_kv_cache.shape[2] == pool_size
++    assert tail_kv_cache.shape[3] == head_dim
++    assert tail_kv_cache.dtype == torch.bfloat16
++    assert key.ndim == 2 and key.shape[1] == head_dim and key.stride(1) == 1
++    assert slot_score.shape == key.shape and slot_score.stride(1) == 1
++    assert ape.shape == (pool_size, head_dim)
++    assert tail_slot_mapping.shape == slot_mapping.shape == positions.shape == key.shape[:1]
++    assert req_len.shape == req_start.shape
++    assert key.dtype == torch.bfloat16
++    assert slot_score.dtype == torch.bfloat16
++    assert ape.dtype == torch.float32
++    assert kv_cache.dtype == torch.uint8
++
++    page_size = kv_cache.shape[1]
++    _kpool_decode_update_batched_kernel[(num_requests,)](
++        kv_cache.view(torch.float8_e4m3fn),
++        kv_cache.view(torch.float32),
++        tail_kv_cache,
++        tail_slot_mapping.contiguous(),
++        key,
++        0,
++        key.stride(0),
++        slot_score,
++        0,
++        slot_score.stride(0),
++        ape,
++        ape.stride(0),
++        slot_mapping.contiguous(),
++        positions.contiguous(),
++        req_start,
++        req_len,
++        0,
++        PAGE_SIZE=page_size,
++        BUF_NUMEL_PER_PAGE=kv_cache.stride(0),
++        POOL_SIZE=pool_size,
++        TAIL_BLOCK_ELEMS=tail_kv_cache.stride(0),
++        KPOOL_HEAD=tail_kv_cache.stride(1),
++        HEAD_DIM=head_dim,
++        S_OFFSET_NBYTES_IN_PAGE=page_size * head_dim,
++        ROUND_SCALE=round_scale,
++        BLOCK_D=triton.next_power_of_2(head_dim),
++        VARLEN=True,
++    )
++
++
+ # Pool-level top-k helpers.
+ 
+ 
+diff --git a/vllm/transformers_utils/configs/speculators/algos.py b/vllm/transformers_utils/configs/speculators/algos.py
+index 9f45183328..d355965204 100644
+--- a/vllm/transformers_utils/configs/speculators/algos.py
++++ b/vllm/transformers_utils/configs/speculators/algos.py
+@@ -199,6 +199,11 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
+     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+     # DSpark indexes target layers as aux_id - 1 (matches the dense configs).
+     pre_trained_config["target_layer_ids"] = [i - 1 for i in aux_layer_ids]
++    # forespark: speculators masks DSpark's sliding-window layers causally unless
++    # it trained with sliding_window_non_causal; full attention is always
++    # bidirectional. Serve the drafter as it trained.
++    if config_dict.get("sliding_window_non_causal"):
++        pre_trained_config["dflash_config"] = {"causal": False}
+ 
+     for key in (
+         "draft_vocab_size",
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
+index 837dbca817..72e4d5c403 100644
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -613,6 +613,11 @@ class DeepSeekV32IndexerDecodeMetadata:
+     decode_is_uniform: bool = True
+     write_max_decode_len: int = 0
+     indices: torch.Tensor | None = None
++    # Each decode request's first token (adaptive verification only, else
++    # None): its captured decode graphs replay any mix of 1..next_n tokens per
++    # request, not the capture batch's, so the kpool write reads every request
++    # in place instead of trusting the capture-time layout.
++    per_req_decode_starts: torch.Tensor | None = None
+ 
+ 
+ @dataclass
+@@ -806,6 +811,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+         self.indexer_uses_fp4 = dsa_indexer_uses_fp4(self.vllm_config)
+ 
+         next_n = self.num_speculative_tokens + 1
++        spec_config = self.vllm_config.speculative_config
++        self.varlen_decode = bool(
++            spec_config is not None and spec_config.enable_adaptive_verification
++        )
+         self.decode_threshold = next_n
+         self.reorder_batch_threshold = None
+         self.use_flattening = _use_flattening(self.vllm_config)
+@@ -835,6 +844,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             dtype=torch.int32,
+             device=self.device,
+         )
++        self.per_req_decode_starts_buffer = (
++            torch.zeros_like(self.per_req_decode_lens_buffer)
++            if self.varlen_decode
++            else None
++        )
+         # Shared workspace for decode seq_lens. Native MTP views this as
+         # (B, max_decode_len) at runtime, keeping context_lens contiguous even
+         # when max_decode_len is smaller than next_n.
+@@ -1340,6 +1354,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+             decode_lens_cpu = torch.diff(
+                 common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+             )
++            per_req_decode_starts = None
++            if self.per_req_decode_starts_buffer is not None:
++                per_req_decode_starts = self.per_req_decode_starts_buffer[:num_decodes]
++                per_req_decode_starts.copy_(
++                    common_attn_metadata.query_start_loc[:num_decodes]
++                )
+ 
+             # Under DCP the per-token decode bounds must be localized AFTER the
+             # per-token expansion below, not before. Expanding from a
+@@ -1515,6 +1535,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
+                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
+                 decode_is_uniform=write_is_uniform,
+                 write_max_decode_len=max_decode_len,
++                per_req_decode_starts=per_req_decode_starts,
+             )
+ 
+         attn_metadata = DeepseekV32IndexerMetadata(
+diff --git a/vllm/v1/attention/selector.py b/vllm/v1/attention/selector.py
+index 286fdcb8df..cfa16923a3 100644
+--- a/vllm/v1/attention/selector.py
++++ b/vllm/v1/attention/selector.py
+@@ -149,7 +149,8 @@ def get_attn_backend(
+ 
+         # The drafter always runs full-length blocks; only the verifier sees
+         # the trimmed, device-decided query lengths.
+-        use_adaptive_verification = model_tag != "dspark_head"
++        # forespark: dflash2_conf's drafter is loaded with the "dflash_head" tag.
++        use_adaptive_verification = model_tag not in ("dspark_head", "dflash_head")
+ 
+     attn_type = attn_type or AttentionType.DECODER
+     attn_selector_config = AttentionSelectorConfig(
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 28478b69f5..244a7e677b 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1212,6 +1212,23 @@ def _get_kv_cache_groups_glm5_next(
+         for name, spec in kv_cache_spec.items()
+         if not isinstance(spec, (MambaSpec, KpoolTailSpec))
+     }
++    # forespark: a DFlash/EAGLE drafter's plain attention layers sit next to the
++    # MLA stack. They get their own group, each layer aliasing one MLA layer's
++    # slice (block ids are exclusive across groups, as for the mamba groups).
++    draft_specs = {
++        name: spec for name, spec in attn_specs.items() if _is_glm5_draft_spec(spec)
++    }
++    # Hidden-state extraction (drafter training) adds cache layers the same way.
++    hidden_specs = {
++        name: spec
++        for name, spec in attn_specs.items()
++        if isinstance(spec, HiddenStateCacheSpec)
++    }
++    attn_specs = {
++        name: spec
++        for name, spec in attn_specs.items()
++        if name not in draft_specs and name not in hidden_specs
++    }
+     if not mamba_specs or not all(
+         type(spec) is MLAAttentionSpec for spec in attn_specs.values()
+     ):
+@@ -1233,6 +1250,51 @@ def _get_kv_cache_groups_glm5_next(
+     uniform_spec = UniformTypeKVCacheSpecs.from_specs(attn_specs)
+     assert uniform_spec is not None
+ 
++    draft_group: KVCacheGroupSpec | None = None
++    if draft_specs:
++        if len(draft_specs) > len(mla_names):
++            return None
++        aligned: dict[str, KVCacheSpec] = {}
++        for name, spec in draft_specs.items():
++            page = spec.page_size_bytes
++            if page > mla_page:
++                return None
++            # Padded, not widened: as in unify_kv_cache_spec_page_size, a wider
++            # drafter block would coarsen every group's prefix-hit granularity.
++            aligned[name] = (
++                spec if page == mla_page else replace(spec, page_size_padded=mla_page)
++            )
++        draft_uniform = UniformTypeKVCacheSpecs.from_specs(aligned)
++        if draft_uniform is None:
++            return None
++        draft_group = KVCacheGroupSpec(list(aligned), draft_uniform)
++
++    # As the generic path aligns them: the largest block size dividing the MLA
++    # block that fits the MLA page, padded to it; one group per layer. Prefix
++    # caching also needs it to be a multiple of every spec's per-state
++    # compression (the kpool indexer's).
++    hidden_groups: list[KVCacheGroupSpec] = []
++    if hidden_specs:
++        if len(hidden_specs) > len(mla_names):
++            return None
++        mla_block_size = math.gcd(*(mla_specs[name].block_size for name in mla_names))
++        step = math.lcm(*(spec.tokens_per_state for spec in mla_specs.values()))
++        for name, spec in hidden_specs.items():
++            per_token = spec.num_kv_heads * spec.head_size * get_dtype_size(spec.dtype)
++            fits = min(mla_block_size, mla_page // per_token)
++            block_size = max(
++                (d for d in range(step, fits + 1, step) if mla_block_size % d == 0),
++                default=0,
++            )
++            if block_size == 0:
++                return None
++            hidden_groups.append(
++                KVCacheGroupSpec(
++                    [name],
++                    replace(spec, block_size=block_size, page_size_padded=mla_page),
++                )
++            )
++
+     tail_group: KVCacheGroupSpec | None = None
+     if tail_specs:
+         idx_page = next(iter(idx_pages))
+@@ -1271,9 +1333,33 @@ def _get_kv_cache_groups_glm5_next(
+         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+         + ([tail_group] if tail_group is not None else [])
+         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
++        + ([draft_group] if draft_group is not None else [])
++        + hidden_groups
+     )
+ 
+ 
++def _is_glm5_draft_spec(spec: KVCacheSpec) -> bool:
++    return isinstance(spec, AttentionSpec) and not isinstance(
++        spec, (MLAAttentionSpec, KpoolTailSpec)
++    )
++
++
++def _glm5_next_alias_groups(
++    kv_cache_groups: list[KVCacheGroupSpec],
++) -> list[KVCacheGroupSpec]:
++    """The groups whose layers alias MLA slices in a GLM-5.3-Flash grouping:
++    the drafter's, and the hidden-state extraction layers'."""
++    groups = []
++    for group in kv_cache_groups:
++        spec = group.kv_cache_spec
++        if isinstance(spec, HiddenStateCacheSpec) or (
++            isinstance(spec, UniformTypeKVCacheSpecs)
++            and all(_is_glm5_draft_spec(inner) for inner in spec.kv_cache_specs.values())
++        ):
++            groups.append(group)
++    return groups
++
++
+ def _glm5_next_tensor_layout(
+     kv_cache_groups: list[KVCacheGroupSpec],
+ ) -> (
+@@ -1300,15 +1386,27 @@ def _glm5_next_tensor_layout(
+     ]
+     attn_group: KVCacheGroupSpec | None = None
+     tail_group: KVCacheGroupSpec | None = None
++    draft_group: KVCacheGroupSpec | None = None
+     for group in uniform_groups:
+         inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
+         if all(type(spec) is MLAAttentionSpec for spec in inner.values()):
+             attn_group = group
+         elif all(isinstance(spec, KpoolTailSpec) for spec in inner.values()):
+             tail_group = group
++        elif all(_is_glm5_draft_spec(spec) for spec in inner.values()):
++            draft_group = group
++        else:
++            return None
++    hidden_groups = [
++        group
++        for group in kv_cache_groups
++        if isinstance(group.kv_cache_spec, HiddenStateCacheSpec)
++    ]
+     if attn_group is None or not mamba_groups:
+         return None
+-    if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
++    if len(uniform_groups) + len(mamba_groups) + len(hidden_groups) != len(
++        kv_cache_groups
++    ):
+         return None
+ 
+     attn_uniform = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+@@ -1332,6 +1430,18 @@ def _glm5_next_tensor_layout(
+     idx_page = idx_pages.pop()
+     if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
+         return None
++    if draft_group is not None:
++        draft_inner = cast(
++            UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
++        ).kv_cache_specs
++        if len(draft_inner) > len(mla_names) or any(
++            spec.page_size_bytes != mla_page for spec in draft_inner.values()
++        ):
++            return None
++    if len(hidden_groups) > len(mla_names) or any(
++        group.kv_cache_spec.page_size_bytes != mla_page for group in hidden_groups
++    ):
++        return None
+ 
+     tail_names: list[str] = []
+     tail_page = 0
+@@ -1392,6 +1502,11 @@ def unify_kv_cache_spec_page_size(
+         return kv_cache_spec
+ 
+     max_page_size = max(page_sizes)
++    # With Mamba layers, a non-MLA attention layer (a drafter's) is padded rather
++    # than given a wider block: prefix hits land on the LCM of the block sizes
++    # and Mamba states are only checkpointed there, so a doubled drafter block
++    # doubles the shortest reusable prefix and the tokens every hit gives up.
++    has_mamba = any(isinstance(spec, MambaSpec) for spec in kv_cache_spec.values())
+     new_kv_cache_spec = {}
+     for layer_name, layer_spec in kv_cache_spec.items():
+         if layer_spec.page_size_bytes == max_page_size:
+@@ -1408,13 +1523,14 @@ def unify_kv_cache_spec_page_size(
+             new_kv_cache_spec[layer_name] = new_spec
+         else:
+             layer_page_size = layer_spec.page_size_bytes
+-            if max_page_size % layer_page_size == 0:
++            paddable = isinstance(layer_spec, AttentionSpec) and not isinstance(
++                layer_spec, MLAAttentionSpec
++            )
++            if max_page_size % layer_page_size == 0 and not (has_mamba and paddable):
+                 ratio = max_page_size // layer_page_size
+                 new_block_size = layer_spec.block_size * ratio
+                 new_spec = replace(layer_spec, block_size=new_block_size)
+-            elif isinstance(layer_spec, AttentionSpec) and not isinstance(
+-                layer_spec, MLAAttentionSpec
+-            ):
++            elif paddable:
+                 new_spec = replace(layer_spec, page_size_padded=max_page_size)
+             else:
+                 raise NotImplementedError(
+@@ -1718,6 +1834,10 @@ def get_kv_cache_config_from_groups(
+             for group in mamba_groups:
+                 if index < len(group.layer_names):
+                     add_tensor(group.layer_names[index], group.kv_cache_spec, offset)
++        for group in _glm5_next_alias_groups(kv_cache_groups):
++            for index, name in enumerate(group.layer_names):
++                spec = _get_per_layer_spec(group, name)
++                add_tensor(name, spec, index * mla_page * num_blocks)
+ 
+         idx_base = len(mla_names) * mla_page * num_blocks
+         for index, idx_name in enumerate(idx_names):
+@@ -2444,6 +2564,13 @@ def _max_memory_usage_bytes_from_groups(
+         )
+         if tail_names:
+             total_blocks += 1
++        total_blocks += sum(
++            cdiv(
++                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
++                group.kv_cache_spec.page_size_bytes,
++            )
++            for group in _glm5_next_alias_groups(kv_cache_groups)
++        )
+         return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
+ 
+     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index daf2b316d0..f0030b082c 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2273,6 +2273,18 @@ class Scheduler(SchedulerInterface):
+                     )
+             finished_req_ids.clear()
+ 
++        # forespark: what the worker actually verified and drafted this step.
++        if spec_decoding_stats is not None:
++            verified = model_runner_output.num_verified_tokens
++            drafted = model_runner_output.num_drafted_tokens
++            scheduled = spec_decoding_stats.num_draft_tokens
++            spec_decoding_stats.num_verified_tokens = (
++                scheduled if verified is None else verified
++            )
++            spec_decoding_stats.num_drafted_tokens = (
++                scheduled if drafted is None else drafted
++            )
++
+         if (
+             stats := self.make_stats(
+                 spec_decoding_stats,
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index d8924b2738..fb9455d312 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -373,6 +373,12 @@ class ModelRunnerOutput:
+     # ``None`` when ``return_sampling_mask`` is off.
+     sampling_masks: SamplingMaskLists | None = None
+ 
++    # forespark: draft positions actually verified / drafted for this step's
++    # verification, when the worker decided them (adaptive verification,
++    # Fore-D). None means "as scheduled".
++    num_verified_tokens: int | None = None
++    num_drafted_tokens: int | None = None
++
+     @staticmethod
+     def with_kv_conn_output_only(
+         kv_connector_output: KVConnectorOutput | None,
+diff --git a/vllm/v1/spec_decode/metrics.py b/vllm/v1/spec_decode/metrics.py
+index 826dfbd16a..aa5ea38d75 100644
+--- a/vllm/v1/spec_decode/metrics.py
++++ b/vllm/v1/spec_decode/metrics.py
+@@ -29,6 +29,9 @@ class SpecDecodingStats:
+     num_accepted_tokens: int = 0
+     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
+     num_draft_tokens_per_pos: list[int] = field(default_factory=list)
++    # forespark: set once per step by the scheduler from the worker's report.
++    num_verified_tokens: int = 0
++    num_drafted_tokens: int = 0
+ 
+     @classmethod
+     def new(cls, num_spec_tokens: int) -> "SpecDecodingStats":
+@@ -248,6 +251,23 @@ class SpecDecodingProm:
+             int, list[prometheus_client.Counter]
+         ] = {}
+         if not is_diffusion:
++            # forespark: positions the target verified / the drafter drafted.
++            self.counter_spec_decode_num_verified_tokens = create_metric_per_engine(
++                self._counter_cls(
++                    name="vllm:spec_decode_num_verified_tokens",
++                    documentation="Draft tokens the target actually verified.",
++                    labelnames=labelnames,
++                ),
++                per_engine_labelvalues,
++            )
++            self.counter_spec_decode_num_drafted_tokens = create_metric_per_engine(
++                self._counter_cls(
++                    name="vllm:spec_decode_num_drafted_tokens",
++                    documentation="Draft tokens the drafter actually drafted.",
++                    labelnames=labelnames,
++                ),
++                per_engine_labelvalues,
++            )
+             assert speculative_config is not None
+             num_spec_tokens = speculative_config.num_speculative_tokens
+             pos_labelnames = labelnames + ["position"]
+@@ -275,6 +295,13 @@ class SpecDecodingProm:
+         self.counter_spec_decode_num_accepted_tokens[engine_idx].inc(
+             spec_decoding_stats.num_accepted_tokens
+         )
++        if not self.is_diffusion:
++            self.counter_spec_decode_num_verified_tokens[engine_idx].inc(
++                spec_decoding_stats.num_verified_tokens
++            )
++            self.counter_spec_decode_num_drafted_tokens[engine_idx].inc(
++                spec_decoding_stats.num_drafted_tokens
++            )
+         for pos, counter in enumerate(
+             self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
+         ):
+diff --git a/vllm/v1/worker/gpu/async_utils.py b/vllm/v1/worker/gpu/async_utils.py
+index 0ab0ab3f3c..6f1270e32e 100644
+--- a/vllm/v1/worker/gpu/async_utils.py
++++ b/vllm/v1/worker/gpu/async_utils.py
+@@ -1,6 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import atexit
++import collections
+ import contextlib
++import os
++import random
++import time
+ from collections.abc import Iterator
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING
+@@ -45,6 +50,109 @@ class StepTimingEvents:
+     drafter_end: torch.cuda.Event = field(default_factory=_timing_event)
+ 
+ 
++# forespark: serving-time step timing. The column order is the file format:
++# float64 rows appended to $VLLM_STEP_TIMING_FILE. `monotonic` is the step's
++# start on the host's CLOCK_MONOTONIC, shared with a client on the same host.
++STEP_TIMING_FILE_ENV = "VLLM_STEP_TIMING_FILE"
++STEP_TIMING_INTERVAL_ENV = "VLLM_STEP_TIMING_INTERVAL_MS"
++STEP_TIMING_FIELDS = (
++    "monotonic", "num_reqs", "num_tokens", "num_drafted", "full_cudagraph",
++    "prep_ms", "forward_ms", "sample_ms", "draft_ms", "post_ms", "idle_ms",
++)  # fmt: skip
++_START, _FORWARD_START, _FORWARD_END, _SAMPLE_END, _DRAFTER_END, _STEP_END, _NEXT_START = range(7)
++
++
++class _RuntimeStepTimer:
++    """forespark: times sampled serving steps without a sync or a graph change.
++
++    Steps are timed at exponential gaps of mean `interval_s` (no periodic
++    pattern aliases). A timed step's marks are CUDA events from a preallocated
++    pool, recorded between launches on the current stream -- never inside a
++    captured graph -- and read back with `query()` once the GPU has passed the
++    last one, so the host never waits on the GPU. The idle mark is the next
++    step's start: the GPU's wait for the host.
++    """
++
++    def __init__(self, path: str, interval_s: float, pool: int = 64, flush_s: float = 2.0) -> None:
++        self.path, self.interval_s, self.flush_s = path, interval_s, flush_s
++        self._pool = [[_timing_event() for _ in range(_NEXT_START + 1)] for _ in range(pool)]
++        # The runner issues every step on this stream (it caches it too); an
++        # explicit stream halves the cost of a record.
++        self._stream = torch.cuda.current_stream()
++        self._rng = random.Random(0)
++        self._due = time.monotonic()
++        self._current: tuple[list[torch.cuda.Event], list[float], list[bool]] | None = None
++        self._awaiting: tuple[list[torch.cuda.Event], list[float], list[bool]] | None = None
++        self._pending: collections.deque = collections.deque()
++        self._rows: list[list[float]] = []
++        self._flushed = time.monotonic()
++        with open(path, "wb"):
++            pass
++        atexit.register(self.close)
++
++    def step_begin(self) -> None:
++        if self._awaiting is not None:
++            self._awaiting[0][_NEXT_START].record(self._stream)
++            self._pending.append(self._awaiting)
++            self._awaiting = None
++        if self._current is not None:  # the last timed step ran no model
++            self._pool.append(self._current[0])
++            self._current = None
++        self._resolve()
++        now = time.monotonic()
++        # Recording an event mid-capture is illegal (and would time nothing).
++        if now >= self._due and self._pool and not torch.cuda.is_current_stream_capturing():
++            events = self._pool.pop()
++            events[_START].record(self._stream)
++            self._current = (events, [now, 0.0, 0.0, 0.0, 0.0], [False] * (_NEXT_START + 1))
++            self._due = now + (self._rng.expovariate(1.0 / self.interval_s) if self.interval_s > 0 else 0.0)
++
++    def mark(self, index: int) -> None:
++        if self._current is not None:
++            self._current[0][index].record(self._stream)
++            self._current[2][index] = True
++
++    def batch(self, full_cudagraph: bool, num_tokens: int, num_reqs: int) -> None:
++        if self._current is not None:
++            meta = self._current[1]
++            meta[1], meta[2], meta[4] = num_reqs, num_tokens, float(full_cudagraph)
++
++    def drafted(self, count: int) -> None:
++        if self._current is not None:
++            self._current[1][3] = count
++
++    def step_end(self) -> None:
++        if self._current is None:
++            return
++        self.mark(_STEP_END)
++        seen = self._current[2]
++        if seen[_FORWARD_START] and seen[_FORWARD_END] and seen[_SAMPLE_END]:
++            self._awaiting = self._current
++        else:
++            self._pool.append(self._current[0])
++        self._current = None
++
++    def _resolve(self, flush: bool = False) -> None:
++        while self._pending and self._pending[0][0][_NEXT_START].query():
++            events, meta, seen = self._pending.popleft()
++            draft_end = _DRAFTER_END if seen[_DRAFTER_END] else _SAMPLE_END
++            marks = (_START, _FORWARD_START, _FORWARD_END, _SAMPLE_END, draft_end, _STEP_END, _NEXT_START)
++            self._rows.append(meta + [events[a].elapsed_time(events[b]) for a, b in zip(marks, marks[1:])])
++            self._pool.append(events)
++        now = time.monotonic()
++        if self._rows and (flush or now - self._flushed >= self.flush_s):
++            with open(self.path, "ab") as f:
++                f.write(np.asarray(self._rows, dtype=np.float64).tobytes())
++            self._rows.clear()
++            self._flushed = now
++
++    def close(self) -> None:
++        """At exit the run is over: wait for the GPU once and write the rest."""
++        with contextlib.suppress(Exception):
++            torch.cuda.synchronize()
++            self._resolve(flush=True)
++
++
+ class StepTimingCollector:
+     """Times the steps run inside ``collect``; record calls no-op outside it.
+ 
+@@ -57,6 +165,9 @@ class StepTimingCollector:
+         self._step: StepTimingEvents | None = None
+         self._batch = (False, 0, 0)
+         self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
++        # forespark: serving-time timing, started by the first real step on rank 0.
++        self._runtime: _RuntimeStepTimer | None = None
++        self._runtime_path = os.environ.get(STEP_TIMING_FILE_ENV) or None
+ 
+     @contextlib.contextmanager
+     def collect(self) -> Iterator[list[StepTimingSample]]:
+@@ -87,29 +198,59 @@ class StepTimingCollector:
+             for events, (full_cudagraph, num_target_tokens, num_reqs) in timed
+         )
+ 
++    def step_begin(self) -> None:
++        """forespark: a serving (non-dummy) step begins."""
++        if self._runtime_path is not None:
++            path, self._runtime_path = self._runtime_path, None
++            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
++                interval_ms = float(os.environ.get(STEP_TIMING_INTERVAL_ENV, "200"))
++                self._runtime = _RuntimeStepTimer(path, interval_ms / 1000.0)
++        if self._runtime is not None:
++            self._runtime.step_begin()
++
+     def record_batch(self, input_batch: "InputBatch", full_cudagraph: bool) -> None:
+         """Costs from different execution modes must not share a cost curve."""
+         self._batch = (full_cudagraph, input_batch.num_tokens, input_batch.num_reqs)
++        if self._runtime is not None:
++            self._runtime.batch(*self._batch)
+ 
+     def forward_start(self) -> None:
+         if self._collecting:
+             self._step = StepTimingEvents()
+             self._step.forward_start.record()
++        if self._runtime is not None:
++            self._runtime.mark(_FORWARD_START)
+ 
+     def forward_end(self) -> None:
+         if self._step is not None:
+             self._step.forward_end.record()
++        if self._runtime is not None:
++            self._runtime.mark(_FORWARD_END)
++
++    def sample_end(self) -> None:
++        """forespark: sampling (and rejection) done; the drafter runs next."""
++        if self._runtime is not None:
++            self._runtime.mark(_SAMPLE_END)
+ 
+     def drafter_start(self) -> None:
+         if self._step is not None:
+             self._step.drafter_start.record()
+ 
+-    def drafter_end(self) -> None:
++    def drafter_end(self, num_drafted: int | None = None) -> None:
+         """Ends the step: only steps that reach here have a draft cost."""
+         if self._step is not None:
+             self._step.drafter_end.record()
+             self._timed.append((self._step, self._batch))
+             self._step = None
++        if self._runtime is not None:
++            self._runtime.mark(_DRAFTER_END)
++            if num_drafted is not None:
++                self._runtime.drafted(num_drafted)
++
++    def step_end(self) -> None:
++        """forespark: a serving step's last launch is issued."""
++        if self._runtime is not None:
++            self._runtime.step_end()
+ 
+ 
+ class AsyncOutput(AsyncModelRunnerOutput):
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b66d552cb4..6f8e74b8fd 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -658,7 +658,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             vllm_config=self.vllm_config,
+             target_layer_names=target_attn_layer_names,
+             additional_attn_cg_support=additional_attn_cg_support,
++            # forespark: its scheduler brings its own manager and needs a handle to it.
++            manager_cls=getattr(self.speculator, "verification_manager_cls", None),
+         )
++        # forespark: ...and to the runner's persistent per-slot state, which its
++        # pre-draft CUDA graphs read.
++        if self.adaptive_verification is not None and hasattr(
++            self.speculator, "bind_runner"
++        ):
++            self.speculator.bind_runner(self)
+ 
+         self.block_tables = BlockTables(
+             block_sizes=block_sizes,
+@@ -722,6 +730,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             varlen_decode=self.adaptive_verification is not None,
+             ubatch_runner=self.ubatch_runner,
+         )
++        # forespark: on SSM targets a varlen-decode graph may only replay verify rows
++        # (see execute_model).
++        self.decode_graph_needs_verify_rows = self.adaptive_verification is not None
++        self.decode_graph_needs_verify_rows &= any(
++            isinstance(group.kv_cache_spec, MambaSpec)
++            for group in self.kv_cache_config.kv_cache_groups
++        )
+         if self.cache_config.kv_sharing_fast_prefill and self.pcp_manager is None:
+             self.fast_prefill = FastPrefillHelper(
+                 self.cudagraph_manager, self.max_num_tokens
+@@ -880,7 +895,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             spec_hidden_states = hidden_states
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++                # forespark: None under hidden-state extraction.
++                if pre_hc_hidden_states is not None:
++                    spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]
+             if isinstance(self.sampler, GPUWatermarkSampler):
+                 self.speculator.prepare_watermarking(
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+@@ -1041,6 +1058,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         ),
+                     )
+                     if self.speculator is not None:
++                        # forespark: a speculator that replays its graphs (Fore-D
++                        # times them) must not on the profiling KV cache.
++                        self.speculator.profiling_capture = profile_only
+                         with use_workspace_lane(self._draft_workspace_lane):
+                             self.speculator.capture()
+                     if self.adaptive_verification is not None:
+@@ -1161,7 +1181,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
+                 assert self.sampler is not None
+                 self.sampler.add_request(
+-                    req_index, prompt_len, new_req_data.sampling_params
++                    req_index, prompt_len, new_req_data.sampling_params, req_id
+                 )
+                 assert self.prompt_logprobs_worker is not None
+                 self.prompt_logprobs_worker.add_request(
+@@ -1248,10 +1268,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         ]
+         is_prefilling_np = num_computed_prefill_tokens_np < prefill_len_np
+ 
++        # forespark: the draft positions this step actually verifies, for metrics.
++        self._num_verified_tokens: int | None = None
+         if self.adaptive_verification is not None and draft_tokens:
+             num_toks = self.adaptive_verification.get_num_tokens(
+                 num_tokens_per_req, draft_tokens
+             )
++            self._num_verified_tokens = self.adaptive_verification._batch_budget[2]
+ 
+         batch_state = BatchReqState(
+             req_ids=req_ids,
+@@ -1331,11 +1354,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # num_scheduled_tokens represents the draft budget evenly distributed across
+             # all verification requests, `reallocate_drafts` will unevenly assign the
+             # draft budget to requests on the GPU side only.
++            # forespark: a host-ranking manager (GLM targets) maps its per-request
++            # widths onto this batch order, which differs from get_num_tokens'.
++            extra = (
++                {"req_ids": req_ids}
++                if getattr(adaptive_verification, "compact_batch_takes_req_ids", False)
++                else {}
++            )
+             num_scheduled_tokens_np, cu_num_logits_np = (
+                 adaptive_verification.compact_batch(
+                     num_draft_tokens_per_req,
+                     num_scheduled_tokens_np,
+                     cu_num_logits_np,
++                    **extra,
+                 )
+             )
+ 
+@@ -1639,6 +1670,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         valid_dummy_state_slots: bool = False,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
+         if not dummy_run:
++            self.step_timing.step_begin()
+             # Update the request states.
+             self.update_pp_decode_requests()
+             self.finish_requests(scheduler_output)
+@@ -1653,10 +1685,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     scheduler_output, empty_output
+                 )
+ 
++        dummy_context_seq_lens: torch.Tensor | None = None
+         # Get batch descriptor and sync across DP ranks.
+         num_reqs = len(scheduler_output.num_scheduled_tokens)
+         num_toks = scheduler_output.total_num_scheduled_tokens
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
++        if not dummy_run and self.decode_graph_needs_verify_rows:
++            # forespark: upstream keeps prefills out of varlen-decode graphs by length
++            # alone. SSM builders route short prefill chunks and draft-less rows off
++            # the captured verify path, so a replay would read stale state slots.
++            drafts = scheduler_output.scheduled_spec_decode_tokens
++            if not all(
++                (num_drafts := len(drafts.get(req_id, ()))) > 0
++                and num_tokens == num_drafts + 1
++                for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items()
++            ):
++                max_query_len = self.decode_query_len + 1
+         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
+             scheduler_output, dummy_run
+         )
+@@ -1766,6 +1810,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.max_model_len,
+                     input_block_tables=block_tables,
+                 )
++                # forespark: a capture-time metadata build may reset seq_lens (TRITON_ATTN
++                # fills 1s to keep capture fast), which would time this FULL replay without
++                # its context; restored after prepare_attn below.
++                dummy_context_seq_lens = input_batch.seq_lens.clone()
+ 
+         attn_metadata = None
+         slot_mappings_by_layer = None
+@@ -1820,6 +1868,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 # indices from the previous real batch.
+                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
+             )
++            if dummy_context_seq_lens is not None:
++                input_batch.seq_lens.copy_(dummy_context_seq_lens)
+ 
+         input_ids = input_batch.input_ids
+         inputs_embeds = None
+@@ -1948,6 +1998,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     model_output = self.model(**model_inputs)
+ 
+         self.kv_connector.finish_forward()
++        if not dummy_run:  # a dummy run's caller records its own forward end
++            self.step_timing.forward_end()
+ 
+         if self.is_last_pp_rank:
+             if self.use_aux_hidden_state_outputs:
+@@ -2077,6 +2129,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             sampled_token_ids=None,  # type: ignore
+             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+             cudagraph_stats=cudagraph_stats,
++            # forespark: verified and drafted positions of the proposal verified
++            # this step (the speculator's count is from the previous propose).
++            num_verified_tokens=getattr(self, "_num_verified_tokens", None),
++            num_drafted_tokens=getattr(self.speculator, "num_drafted_tokens", None),
+         )
+         # Start async output copy here so that it can overlap with speculator proposal.
+         async_output = AsyncOutput(
+@@ -2119,6 +2175,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_rejected,
+             input_batch.query_start_loc,
+         )
++        self.step_timing.sample_end()
+ 
+         if self.speculator is not None:
+             assert self.sampler is not None
+@@ -2133,7 +2190,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             spec_hidden_states = draft_hidden_states
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
++                # forespark: None under hidden-state extraction.
++                if pre_hc_hidden_states is not None:
++                    spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
+             if isinstance(self.sampler, GPUWatermarkSampler):
+                 self.speculator.prepare_watermarking(
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+@@ -2155,6 +2214,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     dp_sync=dp_sync,
+                     mm_inputs=mm_inputs,
+                 )
++            drafted = getattr(self.speculator, "num_drafted_tokens", None)
++            self.step_timing.drafter_end(
++                input_batch.num_reqs * self.num_speculative_steps if drafted is None else drafted
++            )
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+             if self.adaptive_verification is not None:
+                 self.adaptive_verification.record_confidences(
+@@ -2177,6 +2240,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+         model_runner_output.kv_connector_output = kv_connector_output
+         model_runner_output.ec_connector_output = ec_connector_output
++        self.step_timing.step_end()
+ 
+         return async_output
+ 
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index b069604c29..1e862bb0f1 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -66,9 +66,13 @@ class Sampler:
+         )
+ 
+     def add_request(
+-        self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
++        self,
++        req_idx: int,
++        prompt_len: int,
++        sampling_params: SamplingParams,
++        req_id: str | None = None,
+     ) -> None:
+-        self.sampling_states.add_request(req_idx, sampling_params)
++        self.sampling_states.add_request(req_idx, sampling_params, req_id)
+         self.penalties_state.add_request(req_idx, sampling_params)
+         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
+         self.bad_words_state.add_request(req_idx, sampling_params)
+diff --git a/vllm/v1/worker/gpu/sample/states.py b/vllm/v1/worker/gpu/sample/states.py
+index fe4dee6a6b..6e69e512dd 100644
+--- a/vllm/v1/worker/gpu/sample/states.py
++++ b/vllm/v1/worker/gpu/sample/states.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import hashlib
++
+ import numpy as np
+ import torch
+ 
+@@ -14,6 +16,14 @@ _NP_INT64_MIN = np.iinfo(np.int64).min
+ _NP_INT64_MAX = np.iinfo(np.int64).max
+ 
+ 
++def request_seed(req_id: str) -> int:
++    """The default seed of an unseeded request. Every TP rank must sample the
++    same tokens, so the seed comes from the request id, which all ranks share,
++    not from each worker's own RNG, whose state can drift between ranks."""
++    digest = hashlib.blake2b(req_id.encode(), digest_size=8).digest()
++    return int.from_bytes(digest, "little", signed=True)
++
++
+ class SamplingStates:
+     def __init__(self, max_num_reqs: int, vocab_size: int):
+         self.max_num_reqs = max_num_reqs
+@@ -38,7 +48,12 @@ class SamplingStates:
+         # -1 means no logprobs are requested.
+         self.num_logprobs.fill(NO_LOGPROBS)
+ 
+-    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
++    def add_request(
++        self,
++        req_idx: int,
++        sampling_params: SamplingParams,
++        req_id: str | None = None,
++    ) -> None:
+         self.temperature.np[req_idx] = sampling_params.temperature
+         self.top_p.np[req_idx] = sampling_params.top_p
+         top_k = sampling_params.top_k
+@@ -50,7 +65,11 @@ class SamplingStates:
+         seed = sampling_params.seed
+         self.seeds_set[req_idx] = seed is not None
+         if seed is None:
+-            seed = np.random.randint(_NP_INT64_MIN, _NP_INT64_MAX)
++            seed = (
++                request_seed(req_id)
++                if req_id is not None
++                else np.random.randint(_NP_INT64_MIN, _NP_INT64_MAX)
++            )
+         self.seeds.np[req_idx] = seed
+ 
+         num_logprobs = sampling_params.logprobs
+diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
+index b527c9f21b..8b6f094365 100644
+--- a/vllm/v1/worker/gpu/spec_decode/__init__.py
++++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
+@@ -15,6 +15,13 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
+ 
+         return ExtractHiddenStatesSpeculator(vllm_config, device)
+     elif speculative_config.method == "dflash":
++        # forespark: ForeSpark's drafter (DFlash2 + confidence and Fore-D heads).
++        # Checked first: an unknown architecture silently falls through to
++        # DFlashSpeculator.
++        if "DFlash2ConfDraftModel" in speculative_config.draft_model_config.architectures:
++            from forespark.serving.speculator import create_speculator
++
++            return create_speculator(vllm_config, device)
+         if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
+             from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+                 DFlash2Speculator,
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 245f304ac4..3fdd11e626 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -457,6 +457,7 @@ def maybe_create_adaptive_verification_manager(
+     vllm_config: "VllmConfig",
+     target_layer_names: set[str] | None = None,
+     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
++    manager_cls: type[AdaptiveVerificationManager] | None = None,
+ ) -> AdaptiveVerificationManager | None:
+     if not enable_adaptive_verification:
+         return None
+@@ -496,7 +497,7 @@ def maybe_create_adaptive_verification_manager(
+             "use a backend that does."
+         )
+ 
+-    return AdaptiveVerificationManager(
++    return (manager_cls or AdaptiveVerificationManager)(
+         req_states,
+         query_start_loc,
+         num_bonus_tokens,
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 609924e87f..3ec4494022 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -30,7 +30,7 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+ # per vocab block on load and apply ops like temperature and gumbel, so folding
+ # sampling-param application into those kernels would remove this buffer and
+ # its traffic entirely.
+-MAX_CHUNK_BYTES = 2**30  # 1GB
++MAX_CHUNK_BYTES = 2**33  # 8 GiB: AV verifies at most one chunk of logits
+ _FP32_BYTES = 4
+ 
+ 

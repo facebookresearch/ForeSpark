@@ -1,0 +1,347 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# Modifications to speculators (https://github.com/vllm-project/speculators) at 7a58fc562176, which setup.sh applies
+# to the pinned checkout. Like the files they change, they are licensed under the Apache License 2.0
+# (LICENSES/Apache-2.0.txt). `git apply` skips these lines.
+
+diff --git a/hs_connectors/src/hs_connectors/transfer.py b/hs_connectors/src/hs_connectors/transfer.py
+index cf3b69a..d0f5435 100644
+--- a/hs_connectors/src/hs_connectors/transfer.py
++++ b/hs_connectors/src/hs_connectors/transfer.py
+@@ -125,7 +125,7 @@ class HiddenStatesBackend(ABC):
+ def _load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
+     lock_path = str(file_path) + ".lock"
+     if Path(lock_path).exists():
+-        wait_for_lock(lock_path)
++        wait_for_lock(lock_path, timeout=120.0)  # forespark: 10 s drops big samples
+ 
+     if file_path.exists():
+         return load_file(file_path)
+diff --git a/src/speculators/data_generation/configs.py b/src/speculators/data_generation/configs.py
+index 3d1d4cf..45ced70 100644
+--- a/src/speculators/data_generation/configs.py
++++ b/src/speculators/data_generation/configs.py
+@@ -158,4 +158,8 @@ DATASET_CONFIGS: dict[str, DatasetConfig] = {
+         subset="func_calling",
+         split="train",
+     ),
++    # forespark: the prompt pool built by data.py; inert when FORESPARK_POOL is unset.
++    "pool": DatasetConfig(
++        name="pool", hf_path=os.environ.get("FORESPARK_POOL", ""), split="train"
++    ),
+ }
+diff --git a/src/speculators/models/dflash/core.py b/src/speculators/models/dflash/core.py
+index f144623..5d6aa41 100644
+--- a/src/speculators/models/dflash/core.py
++++ b/src/speculators/models/dflash/core.py
+@@ -320,12 +320,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         device: torch.device,
+         sliding_window: int | None = None,
+         sliding_window_non_causal: bool = False,
++        block_size: int | None = None,
+     ):
+         mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
+             document_ids=document_ids.squeeze(0).to(device),
+             total_seq_len=total_seq_len,
+             anchor_positions=anchor_positions,
+-            block_size=self.block_size,
++            block_size=block_size or self.block_size,
+             sliding_window=sliding_window,
+             sliding_window_non_causal=sliding_window_non_causal,
+         )
+@@ -339,11 +340,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         )
+ 
+     @torch.compiler.disable
+-    def _build_attention_mask(self, loss_mask, max_anchors, document_ids, device):
++    def _build_attention_mask(
++        self, loss_mask, max_anchors, document_ids, device, block_size=None, anchors=None
++    ):
+         total_seq_len = loss_mask.shape[1]
+-
+-        anchor_positions, anchor_valid = select_anchors(
+-            loss_mask, max_anchors, self.block_size
++        block_size = block_size or self.block_size
++        # forespark: `anchors` reuses another forward's (positions, valid) pair.
++        anchor_positions, anchor_valid = anchors or select_anchors(
++            loss_mask, max_anchors, block_size
+         )
+ 
+         full_attn_mask = None
+@@ -354,6 +358,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+                 anchor_positions=anchor_positions,
+                 device=device,
+                 sliding_window=None,
++                block_size=block_size,
+             )
+ 
+         sliding_window_attn_mask = None
+@@ -365,10 +370,34 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+                 device=device,
+                 sliding_window=self.sliding_window,
+                 sliding_window_non_causal=self.sliding_window_non_causal,
++                block_size=block_size,
+             )
+ 
+         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
+ 
++    def _block_targets(
++        self,
++        verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
++        anchored_block_indices: torch.Tensor,  # [num_anchors*block_size]
++    ) -> torch.Tensor:
++        """forespark: the verifier's logits for every anchored block slot."""
++        total_seq_len = verifier_last_hidden_states.shape[1]
++        if anchored_block_indices.numel() < total_seq_len:
++            target_indices = (
++                anchored_block_indices
++                if self.config.sample_from_anchor
++                else (anchored_block_indices - 1) % total_seq_len
++            )
++            return self.verifier_lm_head(
++                self.verifier_norm(verifier_last_hidden_states[:, target_indices])
++            )
++        verifier_logits = self.verifier_lm_head(
++            self.verifier_norm(verifier_last_hidden_states)
++        )
++        if not self.config.sample_from_anchor:
++            verifier_logits = torch.roll(verifier_logits, 1, dims=1)
++        return verifier_logits[:, anchored_block_indices]
++
+     def _backbone_forward(
+         self,
+         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
+@@ -377,6 +406,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
+         document_ids: torch.Tensor,  # [1, total_seq_len]
+         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
++        return_pre_draft_features: bool = False,
++        block_size: int | None = None,
++        anchors: tuple[torch.Tensor, torch.Tensor] | None = None,
++        target_logits: torch.Tensor | None = None,
++        attention_masks: tuple | None = None,
++        return_logits: bool = True,
+         **kwargs,
+     ):
+         """Run the anchored-block draft transformer up to the draft logits.
+@@ -384,21 +419,37 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         Returns ``(hidden, logits, targets, aligned_loss_mask,
+         anchored_block_indices)``. DSpark reuses this and adds its Markov and
+         confidence heads before computing its own loss.
++
++        forespark: `block_size` < the model's drafts a narrower block from the
++        same `anchors` (another forward's pair) with given `target_logits`:
++        a non-causal drafter's draft at another width, for width-conditioned
++        Fore-D labels. `attention_masks` (full, sliding) built by the caller
++        for those `anchors` keep the mask build, which compiled code cannot
++        trace, out of a caller's compiled region; `return_logits=False` skips
++        the vocabulary projection (logits None).
+         """
+         device = hidden_states.device
+         total_seq_len = hidden_states.shape[1]
+         num_anchors = kwargs.pop("max_anchors", 512)
++        narrower = block_size is not None and block_size != self.block_size
++        block_size = block_size or self.block_size
+ 
+         if position_ids is None:
+             position_ids = torch.arange(
+                 total_seq_len, dtype=torch.long, device=device
+             ).unsqueeze(0)
+ 
+-        full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
+-            self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
+-        )
++        if attention_masks is None:
++            full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
++                self._build_attention_mask(
++                    loss_mask, num_anchors, document_ids, device, block_size, anchors
++                )
++            )
++        else:
++            full_attn_mask, sliding_window_attn_mask = attention_masks
++            anchor_positions, anchor_valid = anchors
+ 
+-        mask_tokens_size = num_anchors * self.block_size
++        mask_tokens_size = num_anchors * block_size
+ 
+         mask_token_ids = torch.full(
+             (1, mask_tokens_size),
+@@ -406,7 +457,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+             dtype=torch.long,
+             device=device,
+         )  # shape: [1, num_anchors*block_size]
+-        mask_token_ids[:, :: self.block_size] = input_ids[:, anchor_positions]
++        mask_token_ids[:, ::block_size] = input_ids[:, anchor_positions]
+         noise_embedding = self.embed_tokens(mask_token_ids)
+         # shape: [1, num_anchors*block_size, hidden_size]
+ 
+@@ -415,7 +466,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         # shape: [1, total_seq_len, hidden_size]
+ 
+         mask_position_ids = get_base_indices_for_anchored_blocks(
+-            position_ids[0, anchor_positions], self.block_size
++            position_ids[0, anchor_positions], block_size
+         )
+         position_ids = torch.cat([position_ids, mask_position_ids.unsqueeze(0)], dim=1)
+         # shape: [1, total_seq_len + num_anchors*block_size]
+@@ -425,26 +476,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+ 
+         anchored_block_indices = get_base_indices_for_anchored_blocks(
+-            anchor_positions, self.block_size
++            anchor_positions, block_size
+         )  # shape: [num_anchors*block_size]
+ 
+         with torch.no_grad():
+-            if anchored_block_indices.numel() < total_seq_len:
+-                target_indices = (
+-                    anchored_block_indices
+-                    if self.config.sample_from_anchor
+-                    else (anchored_block_indices - 1) % total_seq_len
++            targets = (
++                target_logits
++                if target_logits is not None
++                else self._block_targets(
++                    verifier_last_hidden_states, anchored_block_indices
+                 )
+-                targets = self.verifier_lm_head(
+-                    self.verifier_norm(verifier_last_hidden_states[:, target_indices])
+-                )
+-            else:
+-                verifier_logits = self.verifier_lm_head(
+-                    self.verifier_norm(verifier_last_hidden_states)
+-                )
+-                if not self.config.sample_from_anchor:
+-                    verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+-                targets = verifier_logits[:, anchored_block_indices]
++            )
+             # shape: [1, num_anchors*block_size, draft_vocab_size]
+ 
+         for layer_idx, layer in enumerate(self.layers):
+@@ -457,11 +499,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+                 position_ids=position_ids,
+                 use_cache=False,
+                 position_embeddings=position_embeddings,
+-                **kwargs,
++                **({**kwargs, "effective_block_size": block_size} if narrower else kwargs),
+             )
+ 
+         hidden = self.norm(noise_embedding)
+-        logits = self.lm_head(hidden)
++        logits = self.lm_head(hidden) if return_logits else None
+         # shape: [1, num_anchors*block_size, vocab_size]
+ 
+         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
+@@ -469,16 +511,26 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
+ 
+         # zero out any padded anchor blocks
+         aligned_loss_mask = aligned_loss_mask * (
+-            anchor_valid.repeat_interleave(self.block_size)
++            anchor_valid.repeat_interleave(block_size)
+             .unsqueeze(0)
+             .to(aligned_loss_mask.dtype)
+         )  # shape: [1, num_anchors*block_size]
+ 
+         # For sample_from_anchor=False, mask slot 0 (anchor) since it's not trained
+         if not self.config.sample_from_anchor:
+-            aligned_loss_mask[:, :: self.block_size] = 0
+-
+-        return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
++            aligned_loss_mask[:, ::block_size] = 0
++
++        output = (hidden, logits, targets, aligned_loss_mask, anchored_block_indices)
++        if return_pre_draft_features:
++            # forespark: what a Fore-D head can see before drafting at serving
++            # time -- the anchor token, and the target hidden state of the token
++            # before it (the one that sampled the anchor). The anchor's own
++            # hidden state does not exist yet when the drafter runs, and the
++            # draft blocks above also attend only to positions < anchor.
++            context = fc_output[0, (anchor_positions - 1).clamp(min=0)]
++            anchor_embeddings = self.embed_tokens(input_ids[0, anchor_positions])
++            return (*output, (context, anchor_embeddings, anchor_valid, anchor_positions))
++        return output
+ 
+     @conditional_torch_compile
+     def forward(
+diff --git a/src/speculators/train/config/resolution.py b/src/speculators/train/config/resolution.py
+index f6579c7..773bc2e 100644
+--- a/src/speculators/train/config/resolution.py
++++ b/src/speculators/train/config/resolution.py
+@@ -93,9 +93,10 @@ REQUIRED_FLAGS: dict[str, str] = _required_flags()
+ # warns. DFlash2 and DSpark share the DFlash backbone group; their exclusive
+ # architecture knobs remain in their own groups. eagle3 uses no group.
+ _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
+-    "dflash": frozenset({"dflash", "dflash2", "dspark"}),
+-    "dflash2": frozenset({"dflash2"}),
+-    "dspark": frozenset({"dspark"}),
++    "dflash": frozenset({"dflash", "dflash2", "dflash2_conf", "dspark"}),
++    "dflash2": frozenset({"dflash2", "dflash2_conf"}),
++    "dspark": frozenset({"dflash2_conf", "dspark"}),
++    "fore_d": frozenset({"dflash2_conf"}),
+     "peagle": frozenset({"peagle"}),
+     "mtp": frozenset({"mtp"}),
+ }
+diff --git a/src/speculators/train/config/schema.py b/src/speculators/train/config/schema.py
+index e0d51c2..c248d95 100644
+--- a/src/speculators/train/config/schema.py
++++ b/src/speculators/train/config/schema.py
+@@ -511,6 +511,25 @@ class DSparkArgs(_Group):
+     )
+ 
+ 
++class ForeDArgs(_Group):
++    """forespark: the width-conditioned pre-draft acceptance (Fore-D) head of dflash2_conf."""
++
++    enable_fore_d_predictor: bool = Field(
++        default=False, description="Train the pre-draft acceptance head."
++    )
++    fore_d_rank: int = Field(
++        default=256, ge=1, description="Hidden rank of the Fore-D head."
++    )
++    fore_d_loss_alpha: float = Field(
++        default=1.0, ge=0.0, description="Weight of the Fore-D loss."
++    )
++    fore_d_narrow_stride: int = Field(
++        default=4,
++        ge=1,
++        description="The head's narrower rows label every n-th anchor of the step.",
++    )
++
++
+ class PEagleArgs(_Group):
+     num_depths: int = Field(
+         default=8,
+@@ -550,6 +569,7 @@ _GROUPS: dict[str, type[_Group]] = {
+     "dflash": DFlashArgs,
+     "dflash2": DFlash2Args,
+     "dspark": DSparkArgs,
++    "fore_d": ForeDArgs,
+     "peagle": PEagleArgs,
+     "mtp": MTPArgs,
+ }
+@@ -660,6 +680,7 @@ class TrainConfig(BaseSettings):
+     dflash: DFlashArgs = Field(default_factory=DFlashArgs)
+     dflash2: DFlash2Args = Field(default_factory=DFlash2Args)
+     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
++    fore_d: ForeDArgs = Field(default_factory=ForeDArgs)
+     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
+     mtp: MTPArgs = Field(default_factory=MTPArgs)
+ 
+diff --git a/src/speculators/train/trainer.py b/src/speculators/train/trainer.py
+index a342b45..2bc7663 100644
+--- a/src/speculators/train/trainer.py
++++ b/src/speculators/train/trainer.py
+@@ -467,7 +467,12 @@ class Trainer:
+             timer.mark("fwd")
+             self._optimizers_zero_grad()
+             loss.backward()
+-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
++            # forespark: a model may clip parameter groups separately (the Fore-D
++            # head must not be starved by the drafter's gradient norm).
++            model = getattr(self.model, "module", self.model)
++            groups = getattr(model, "gradient_clip_groups", None)
++            for params in groups() if groups else (self.model.parameters(),):
++                torch.nn.utils.clip_grad_norm_(params, 1.0)
+ 
+             timer.mark("bwd")
+             self._optimizers_step()
