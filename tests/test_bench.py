@@ -903,6 +903,8 @@ def test_report_averages_rounds_with_intervals(tmp_path):
         write_result(tmp_path / f"a-r{round_}.json", "a", tok_s, round_)
     write_result(tmp_path / "b1.json", "b", 70.0, None)
     write_result(tmp_path / "b2.json", "b", 80.0, None)  # newer untagged: a correction
+    stamp = (tmp_path / "b1.json").stat().st_mtime + 1
+    os.utime(tmp_path / "b2.json", (stamp, stamp))  # Linux can give both one mtime
     cells = report.load_cells(tmp_path)
     a, b = (
         cells[("m", "sharegpt", "tp1", "a", 8)],
