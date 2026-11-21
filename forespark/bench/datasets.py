@@ -31,7 +31,8 @@ def load_prompts(path: Path) -> list[dict]:
     """Rows from a JSONL file."""
     if not path.is_file():
         raise SystemExit(f"missing {path}; run `./eval.py prepare` first")
-    rows = [json.loads(line) for line in path.open() if line.strip()]
+    with path.open() as handle:
+        rows = [json.loads(line) for line in handle if line.strip()]
     if not rows:
         raise SystemExit(f"no prompts in {path}")
     return rows
